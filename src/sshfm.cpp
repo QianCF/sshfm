@@ -293,16 +293,6 @@ static size_t next_cluster(const std::string &s, size_t i)
 	int nb;
 	unsigned int c = u8decode(s, i, &nb);
 	size_t j = i + (size_t)nb;
-	if (c == 0x1B) {                 /* an ANSI escape sequence: zero width */
-		if (j < n && (s[j] == '[' || s[j] == 'O')) {
-			j++;
-			while (j < n && !(s[j] >= '@' && s[j] <= '~'))
-				j++;
-			if (j < n)
-				j++;             /* include the final byte */
-		}
-		return j;
-	}
 	if (is_ri(c) && j < n) {                       /* flag = pair of RIs */
 		int nb2;
 		unsigned int c2 = u8decode(s, j, &nb2);
@@ -343,16 +333,40 @@ static size_t prev_cluster(const std::string &s, size_t i)
 	return prev;
 }
 
-/* replace C0 control bytes (except TAB) and DEL with '?' so a hostile file
- * name or file content cannot inject terminal escape sequences.  The mapping
- * is 1 byte -> 1 byte, so byte offsets (editor cursors) stay valid. */
-static std::string sanitize_ctrl(const std::string &s)
+/* ---- control bytes ----------------------------------------------------
+ * A raw control byte in a name or in file content is never sent to the
+ * terminal as-is; it is shown as visible text in bright black, in standard
+ * caret notation (^N, ^S, ^[, ^?, ...) regardless of whether this app
+ * happens to intercept that key.  The raw byte stays untouched in the data;
+ * only the rendering expands it. */
+static bool is_ctrl_byte(unsigned char c)
 {
-	std::string o = s;
-	for (size_t i = 0; i < o.size(); i++) {
-		unsigned char c = (unsigned char)o[i];
-		if ((c < 0x20 && c != 0x09) || c == 0x7F)
-			o[i] = '?';
+	return c < 0x20 || c == 0x7F;
+}
+/* standard caret notation, always two columns:
+ *   ^@ ^A..^Z ^[ ^\ ^] ^^ ^_   for 0x00..0x1F, and ^? for 0x7F */
+static std::string ctrl_text(unsigned char c)
+{
+	return std::string("^") + (char)(c == 0x7F ? '?' : c + 0x40);
+}
+/* expand a raw string for display: control bytes become bright-black text,
+ * so a hostile name / file can never emit an escape sequence. */
+static std::string disp_expand(const std::string &s)
+{
+	std::string o;
+	for (size_t i = 0; i < s.size();) {
+		unsigned char c = (unsigned char)s[i];
+		if (is_ctrl_byte(c)) {
+			o += "\x1b[90m";
+			o += ctrl_text(c);
+			o += "\x1b[39m";
+			i++;
+			continue;
+		}
+		if (c < 0x80) { o += (char)c; i++; continue; }
+		size_t j = next_cluster(s, i);
+		o.append(s, i, j - i);
+		i = j;
 	}
 	return o;
 }
@@ -368,8 +382,9 @@ static int cluster_width(const std::string &s, size_t i, size_t end)
 {
 	{
 		int nb0;
-		if (u8decode(s, i, &nb0) == 0x1B)
-			return 0;          /* escape sequences take no cells */
+		unsigned int c0 = u8decode(s, i, &nb0);
+		if (is_ctrl_byte((unsigned char)c0))
+			return (int)ctrl_text((unsigned char)c0).size();
 	}
 	bool emoji = false, zwj = false;
 	int w = 0;
@@ -719,8 +734,6 @@ public:
 		if (n.empty() || n == "." || n == "..") return false;
 		if (n.find('/') != std::string::npos) return false;
 		if (n.find('\0') != std::string::npos) return false;
-		for (unsigned char c : n)                /* no control characters */
-			if (c < 0x20 || c == 0x7F) return false;
 		return true;
 	}
 
@@ -1411,6 +1424,7 @@ private:
 	void draw_input(std::string &s);
 	void put(std::string &s, int row, int col, const std::string &text);
 	void put_fill(std::string &s, int row, const std::string &text, int w);
+	void put_disp(std::string &s, int row, const std::string &disp);
 
 	bool next_key(KeyEvent &ev);
 	void handle_list(const KeyEvent &ev);
@@ -1465,15 +1479,22 @@ void UI::put(std::string &s, int row, int col, const std::string &text)
 	s += text;
 }
 
-/* write text padded/clipped to exactly `w` display columns, filling `w` */
+/* write text padded/clipped to exactly `w` display columns, filling `w`.
+ * Control bytes are expanded on the way out (the clip happens on raw). */
 void UI::put_fill(std::string &s, int row, const std::string &text, int w)
 {
 	std::string t = u8clip(text, w);
 	int pad = w - u8width(t);
 	if (pad < 0) pad = 0;
-	s += sfmt("\x1b[%d;1H%s", row, t.c_str());
+	s += sfmt("\x1b[%d;1H%s", row, disp_expand(t).c_str());
 	for (int i = 0; i < pad; i++)
 		s += " ";
+}
+
+/* write an already-rendered display string (exact width, escapes included) */
+void UI::put_disp(std::string &s, int row, const std::string &disp)
+{
+	s += sfmt("\x1b[%d;1H%s", row, disp.c_str());
 }
 
 /* ---- layout ---- */
@@ -1886,7 +1907,7 @@ bool UI::marquee_active() const
 {
 	if (u8width(title_text()) > cols_)
 		return true;
-	if (u8width(sanitize_ctrl(status_)) > cols_)
+	if (u8width(status_) > cols_)
 		return true;   /* the message bar scrolls when too long */
 	if (msg_scroll_ != 0)
 		return true;
@@ -1899,7 +1920,7 @@ bool UI::marquee_active() const
 	int w[6] = {0};
 	cell_widths(elines[0], w);
 	const Entry &e = entries_[sel_];
-	std::string nm = sanitize_ctrl(e.name) + (e.isdir ? "/" : "");
+	std::string nm = e.name + (e.isdir ? "/" : "");
 	return u8width(nm) > w[0];
 }
 
@@ -1908,15 +1929,15 @@ std::string UI::title_text() const
 	if (mode_ == CAPTCHA) {
 		int left = (int)(captcha_deadline_ - time(nullptr));
 		if (left < 0) left = 0;
-		return sanitize_ctrl(captcha_weak_
+		return captcha_weak_
 		    ? sfmt(" sshfm  low captcha   time left: %ds", left)
-		    : sfmt(" sshfm  captcha   time left: %ds", left));
+		    : sfmt(" sshfm  captcha   time left: %ds", left);
 	}
 	if (content_view() == EDITOR)
-		return sanitize_ctrl(sfmt(" edit: %s   line %d/%d", edit_rel_.c_str(),
-		                          cy_ + 1, editor_line_count()));
-	return sanitize_ctrl(sfmt(" sshfm  /%s   [%s]   ol %d/%d", cwd_.c_str(),
-	                          ip_.c_str(), here_count(), g_online.load()));
+		return sfmt(" edit: %s   line %d/%d", edit_rel_.c_str(),
+		            cy_ + 1, editor_line_count());
+	return sfmt(" sshfm  /%s   [%s]   ol %d/%d", cwd_.c_str(), ip_.c_str(),
+	            here_count(), g_online.load());
 }
 
 void UI::draw_scrollbar(std::string &s, int first, int count, int total)
@@ -1998,7 +2019,7 @@ void UI::draw_list(std::string &s)
 		int w0[6] = {0};
 		cell_widths(elines[0], w0);
 		std::string cell[6];
-		cell[0] = sanitize_ctrl(e.name) + (e.isdir ? "/" : "");
+		cell[0] = e.name + (e.isdir ? "/" : "");
 		cell[1] = e.isdir ? "<DIR>" : fmt_size(e.size, w0[1]);
 		cell[2] = fmt_time(e.meta.creator_ts);
 		cell[3] = fmt_time(e.meta.mtime_ts);
@@ -2008,13 +2029,14 @@ void UI::draw_list(std::string &s)
 		std::string nmdisp = cell[0];
 		if (selected && u8width(cell[0]) > w0[0])
 			nmdisp = cyclic_window(cell[0], name_scroll_, w0[0]);
-		/* a file being edited elsewhere: reverse video on its name */
+		/* a file being edited elsewhere: reverse video on its name.  The
+		 * escapes are emitted AROUND the padded cell, never inside a string
+		 * that is clipped, so a marquee can not cut them off. */
 		std::string rel = cwd_.empty() ? e.name : cwd_ + "/" + e.name;
 		bool locked = !e.isdir && filelock_held(rel);
-		if (locked && !selected)
-			nmdisp = "\x1b[7m" + nmdisp + "\x1b[27m";
-		else if (locked && selected)
-			nmdisp = "\x1b[27m" + nmdisp + "\x1b[7m";   /* name stands out */
+		std::string nmpre, nmpost;
+		if (locked && !selected) { nmpre = "\x1b[7m"; nmpost = "\x1b[27m"; }
+		else if (locked && selected) { nmpre = "\x1b[27m"; nmpost = "\x1b[7m"; }
 		if (selected)
 			s += "\x1b[7m";
 		for (size_t li = 0; li < elines.size() && row <= main_bottom_; li++) {
@@ -2023,11 +2045,16 @@ void UI::draw_list(std::string &s)
 			std::string line;
 			for (size_t k = 0; k < elines[li].size(); k++) {
 				int c = elines[li][k];
-				std::string txt = (li == 0 && c == 0) ? nmdisp : cell[c];
-				line += pad_to(txt, w[c], c == 1);
+				if (li == 0 && c == 0) {
+					line += nmpre;
+					line += disp_expand(pad_to(nmdisp, w[0], false));
+					line += nmpost;
+				} else {
+					line += disp_expand(pad_to(cell[c], w[c], c == 1));
+				}
 				if (k + 1 < elines[li].size()) line += " ";
 			}
-			put_fill(s, row, line, main_cols_);
+			put_disp(s, row, line);
 			row++;
 		}
 		if (selected)
@@ -2054,7 +2081,7 @@ std::vector<std::pair<int, int>> UI::editor_display()
 	if (w < 1) w = 1;
 	std::vector<std::pair<int, int>> out;   /* (logical line, byte offset in line) */
 	for (int li = 0; li < editor_line_count(); li++) {
-		std::vector<std::string> chunks = u8wrap(sanitize_ctrl(lines_[li]), w);
+		std::vector<std::string> chunks = u8wrap(lines_[li], w);
 		size_t off = 0;
 		for (size_t ci = 0; ci < chunks.size(); ci++) {
 			out.push_back({li, (int)off});
@@ -2100,11 +2127,11 @@ void UI::draw_editor(std::string &s)
 	{
 		int n = 0;
 		for (int li = 0; li < cy_; li++) {
-			std::vector<std::string> c = u8wrap(sanitize_ctrl(lines_[li]), w);
+			std::vector<std::string> c = u8wrap(lines_[li], w);
 			n += (int)c.size();
 		}
-		std::vector<std::string> c = u8wrap(sanitize_ctrl(lines_[cy_]), w);
-		int col = u8width(sanitize_ctrl(lines_[cy_]).substr(0, cx_));
+		std::vector<std::string> c = u8wrap(lines_[cy_], w);
+		int col = u8width(lines_[cy_].substr(0, cx_));
 		int ci = (w > 0) ? col / w : 0;
 		if (ci >= (int)c.size()) ci = (int)c.size() - 1;
 		cdisp = n + ci;
@@ -2129,7 +2156,7 @@ void UI::draw_editor(std::string &s)
 		}
 		int li = disp[di].first;
 		int off = disp[di].second;
-		std::vector<std::string> chunks = u8wrap(sanitize_ctrl(lines_[li]), w);
+		std::vector<std::string> chunks = u8wrap(lines_[li], w);
 		/* find the chunk index for this display line */
 		int ci = 0, acc = off;
 		(void)acc;
@@ -2145,7 +2172,8 @@ void UI::draw_editor(std::string &s)
 		}
 		std::string chunk = (ci < (int)chunks.size()) ? chunks[ci] : "";
 		std::string num = (ci == 0) ? sfmt("%*d ", numw - 1, li + 1) : std::string(numw, ' ');
-		put(s, row, 1, sfmt("\x1b[K%s%s", num.c_str(), chunk.c_str()));
+		put(s, row, 1, sfmt("\x1b[K%s%s", num.c_str(),
+		                    disp_expand(chunk).c_str()));
 	}
 	draw_scrollbar(s, etop_, mainh, (int)disp.size());
 	if (etop_ < (int)disp.size())
@@ -2166,11 +2194,11 @@ void UI::draw_keys(std::string &s)
 
 void UI::draw_msg(std::string &s)
 {
-	std::string t = sanitize_ctrl(status_);
-	if (t != msg_shown_) {          /* new message: restart the marquee */
+	if (status_ != msg_shown_) {    /* new message: restart the marquee */
 		msg_scroll_ = 0;
-		msg_shown_ = t;
+		msg_shown_ = status_;
 	}
+	std::string t = status_;
 	if (u8width(t) > cols_)
 		t = cyclic_window(t, msg_scroll_, cols_);
 	put_fill(s, msg_row_, t, cols_);
@@ -2241,7 +2269,7 @@ void UI::draw_input(std::string &s)
 		}
 	}
 	prompt_curcol_ = curcol;
-	put(s, input_row_, 1 + labw, shown.c_str());
+	put(s, input_row_, 1 + labw, disp_expand(shown).c_str());
 }
 
 /* client rendering calibration, measured via cursor-position reports:
@@ -2386,9 +2414,9 @@ void UI::render()
 		if (w < 1) w = 1;
 		int cdisp = 0;
 		for (int li = 0; li < cy_; li++)
-			cdisp += (int)u8wrap(sanitize_ctrl(lines_[li]), w).size();
+			cdisp += (int)u8wrap(lines_[li], w).size();
 		int chunk = 0, col = 0;
-		cursor_chunk(sanitize_ctrl(lines_[cy_]), cx_, w, chunk, col);
+		cursor_chunk(lines_[cy_], cx_, w, chunk, col);
 		cdisp += chunk;
 		int ccol = numw + col;
 		if (ccol < 0) ccol = 0;
@@ -2980,7 +3008,7 @@ void UI::editor_remember_goal()
 	int w = main_cols_ - numw - 1;
 	if (w < 1) w = 1;
 	int chunk = 0, col = 0;
-	cursor_chunk(sanitize_ctrl(lines_[cy_]), cx_, w, chunk, col);
+	cursor_chunk(lines_[cy_], cx_, w, chunk, col);
 	goal_col_ = col;
 }
 
@@ -3009,9 +3037,9 @@ void UI::handle_editor(const KeyEvent &ev)
 		/* current visual row of the cursor + its column */
 		int d = 0;
 		for (int li = 0; li < cy_; li++)
-			d += (int)u8wrap(sanitize_ctrl(lines_[li]), w).size();
+			d += (int)u8wrap(lines_[li], w).size();
 		int chunk = 0, col = 0;
-		cursor_chunk(sanitize_ctrl(lines_[cy_]), cx_, w, chunk, col);
+		cursor_chunk(lines_[cy_], cx_, w, chunk, col);
 		d += chunk;
 		if (goal_col_ >= 0)
 			col = goal_col_;   /* vertical moves reuse the remembered column */
@@ -3021,7 +3049,7 @@ void UI::handle_editor(const KeyEvent &ev)
 			 * nothing to do with this */
 			int total = 0;
 			for (int li = 0; li < editor_line_count(); li++)
-				total += (int)u8wrap(sanitize_ctrl(lines_[li]), w).size();
+				total += (int)u8wrap(lines_[li], w).size();
 			if (ev.key == Key::PageUp)
 				etop_ -= mainh;
 			else
@@ -3046,7 +3074,7 @@ void UI::handle_editor(const KeyEvent &ev)
 		/* locate the logical line / chunk of visual row nd */
 		int total2 = 0, tl = -1, tc = 0;
 		for (int li = 0; li < editor_line_count(); li++) {
-			int nch = (int)u8wrap(sanitize_ctrl(lines_[li]), w).size();
+			int nch = (int)u8wrap(lines_[li], w).size();
 			if (nd < total2 + nch) { tl = li; tc = nd - total2; break; }
 			total2 += nch;
 		}
@@ -3056,7 +3084,7 @@ void UI::handle_editor(const KeyEvent &ev)
 			break;
 		}
 		cy_ = tl;
-		cx_ = (int)chunk_byte_offset(sanitize_ctrl(lines_[cy_]), tc, col, w);
+		cx_ = (int)chunk_byte_offset(lines_[cy_], tc, col, w);
 		break;
 	}
 	case Key::Left:
@@ -3537,13 +3565,12 @@ void UI::run(ssh_channel ch, int cols, int rows)
 				}
 				if (sel_ >= 0 && sel_ < (int)entries_.size()) {
 					const Entry &e = entries_[sel_];
-					int W = u8width(sanitize_ctrl(e.name)
-					                + (e.isdir ? "/" : "") + "   ");
+					int W = u8width(e.name + (e.isdir ? "/" : "") + "   ");
 					if (W > 0)
 						name_scroll_ = (name_scroll_ + 1) % W;
 				}
 				{
-					std::string st = sanitize_ctrl(status_);
+					const std::string &st = status_;
 					if (u8width(st) > cols_) {
 						int W = u8width(st + "   ");
 						if (W > 0)
@@ -3890,7 +3917,7 @@ int main(int argc, char **argv)
 	ssh_bind bind = ssh_bind_new();
 	ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BINDADDR, "0.0.0.0");
 	ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BINDPORT, &port);
-	ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BANNER, "sshfm_1.1");
+	ssh_bind_options_set(bind, SSH_BIND_OPTIONS_BANNER, "sshfm_1.2");
 	/* no fake version banner: libssh announces itself, so clients do not
 	 * apply OpenSSH-specific expectations we cannot satisfy */
 
